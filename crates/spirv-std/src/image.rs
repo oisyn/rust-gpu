@@ -10,11 +10,16 @@ use core::arch::asm;
 #[rustfmt::skip]
 mod params;
 
+/// Contains extra image operands
+pub mod sample_with;
+
 pub use self::params::{ImageCoordinate, ImageCoordinateSubpassData, SampleType};
 pub use crate::macros::Image;
 pub use spirv_std_types::image_params::{
     AccessQualifier, Arrayed, Dimensionality, ImageDepth, ImageFormat, Multisampled, Sampled,
 };
+
+use sample_with::{NoneTy, SampleParams, SomeTy};
 
 use crate::{float::Float, integer::Integer, vector::Vector, Sampler};
 
@@ -190,7 +195,7 @@ impl<
         sampler: Sampler,
         coordinate: impl ImageCoordinate<F, DIM, ARRAYED>,
         component: u32,
-    ) -> SampledType::SampleResult
+    ) -> SampledType::Vec4
     where
         Self: HasGather,
         F: Float,
@@ -212,7 +217,7 @@ impl<
                 component = in(reg) component,
             }
         }
-        result.truncate_into()
+        result
     }
 
     /// Sample texels at `coord` from the image using `sampler`.
@@ -1112,6 +1117,299 @@ impl<
             );
         }
         result.truncate_into()
+    }
+}
+
+/// Helper trait that defines all `*_with` methods on an `Image` that use the extra image operands,
+/// such as bias or lod, defined by the `SampleParams` struct.
+pub trait ImageWithMethods<
+    SampledType: SampleType<FORMAT, COMPONENTS>,
+    const DIM: u32,
+    const DEPTH: u32,
+    const ARRAYED: u32,
+    const MULTISAMPLED: u32,
+    const SAMPLED: u32,
+    const FORMAT: u32,
+    const COMPONENTS: u32,
+    Params,
+>
+{
+    /// Fetch a single texel with a sampler set at compile time
+    #[doc(alias = "OpImageFetch")]
+    fn fetch_with<I>(
+        &self,
+        coordinate: impl ImageCoordinate<I, DIM, ARRAYED>,
+        params: Params,
+    ) -> SampledType::SampleResult
+    where
+        I: Integer;
+
+    /// Gathers the requested component from four texels.
+    #[doc(alias = "OpImageGather")]
+    fn gather_with<F>(
+        &self,
+        sampler: Sampler,
+        coordinate: impl ImageCoordinate<F, DIM, ARRAYED>,
+        component: u32,
+        params: Params,
+    ) -> SampledType::Vec4
+    where
+        Self: HasGather,
+        F: Float;
+
+    /// Sample texels at `coord` from the image using `sampler`.
+    fn sample_with<F>(
+        &self,
+        sampler: Sampler,
+        coord: impl ImageCoordinate<F, DIM, ARRAYED>,
+        params: Params,
+    ) -> SampledType::SampleResult
+    where
+        F: Float;
+
+    /// Sample the image's depth reference
+    #[doc(alias = "OpImageSampleDrefImplicitLod")]
+    fn sample_depth_reference_with<F>(
+        &self,
+        sampler: Sampler,
+        coordinate: impl ImageCoordinate<F, DIM, ARRAYED>,
+        depth_reference: f32,
+        params: Params,
+    ) -> SampledType
+    where
+        F: Float;
+
+    /// Sample the image with a project coordinate
+    #[doc(alias = "OpImageSampleProjImplicitLod")]
+    fn sample_with_project_coordinate_with<F>(
+        &self,
+        sampler: Sampler,
+        project_coordinate: impl ImageCoordinate<F, DIM, { Arrayed::True as u32 }>,
+        params: Params,
+    ) -> SampledType::SampleResult
+    where
+        F: Float;
+
+    /// Sample the image's depth reference with the project coordinate
+    #[doc(alias = "OpImageSampleProjDrefImplicitLod")]
+    fn sample_depth_reference_with_project_coordinate_with<F>(
+        &self,
+        sampler: Sampler,
+        project_coordinate: impl ImageCoordinate<F, DIM, { Arrayed::True as u32 }>,
+        depth_reference: f32,
+        params: Params,
+    ) -> SampledType
+    where
+        F: Float;
+}
+
+#[crate::macros::gen_sample_param_permutations]
+impl<
+        SampledType: SampleType<FORMAT, COMPONENTS>,
+        const DIM: u32,
+        const DEPTH: u32,
+        const ARRAYED: u32,
+        const MULTISAMPLED: u32,
+        const SAMPLED: u32,
+        const FORMAT: u32,
+        const COMPONENTS: u32,
+    >
+    ImageWithMethods<
+        SampledType,
+        DIM,
+        DEPTH,
+        ARRAYED,
+        MULTISAMPLED,
+        SAMPLED,
+        FORMAT,
+        COMPONENTS,
+        SampleParams,
+    > for Image<SampledType, DIM, DEPTH, ARRAYED, MULTISAMPLED, SAMPLED, FORMAT, COMPONENTS>
+{
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageFetch")]
+    fn fetch_with<I>(
+        &self,
+        coordinate: impl ImageCoordinate<I, DIM, ARRAYED>,
+        params: SampleParams,
+    ) -> SampledType::SampleResult
+    where
+        I: Integer,
+    {
+        let mut result = SampledType::Vec4::default();
+        unsafe {
+            asm! {
+                "%image = OpLoad _ {this}",
+                "%coordinate = OpLoad _ {coordinate}",
+                "%result = OpImageFetch typeof*{result} %image %coordinate $PARAMS",
+                "OpStore {result} %result",
+                result = in(reg) &mut result,
+                this = in(reg) self,
+                coordinate = in(reg) &coordinate,
+            }
+        }
+        result.truncate_into()
+    }
+
+    /// Gathers the requested component from four texels.
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageGather")]
+    #[inline]
+    fn gather_with<F>(
+        &self,
+        sampler: Sampler,
+        coordinate: impl ImageCoordinate<F, DIM, ARRAYED>,
+        component: u32,
+        params: SampleParams,
+    ) -> SampledType::Vec4
+    where
+        Self: HasGather,
+        F: Float,
+    {
+        let mut result = SampledType::Vec4::default();
+        unsafe {
+            asm! {
+                "%typeSampledImage = OpTypeSampledImage typeof*{this}",
+                "%image = OpLoad _ {this}",
+                "%sampler = OpLoad _ {sampler}",
+                "%coordinate = OpLoad _ {coordinate}",
+                "%sampledImage = OpSampledImage %typeSampledImage %image %sampler",
+                "%result = OpImageGather typeof*{result} %sampledImage %coordinate {component} $PARAMS",
+                "OpStore {result} %result",
+                result = in(reg) &mut result,
+                this = in(reg) self,
+                sampler = in(reg) &sampler,
+                coordinate = in(reg) &coordinate,
+                component = in(reg) component,
+            }
+        }
+        result
+    }
+
+    /// Sample texels at `coord` from the image using `sampler`.
+    #[crate::macros::gpu_only]
+    fn sample_with<F>(
+        &self,
+        sampler: Sampler,
+        coord: impl ImageCoordinate<F, DIM, ARRAYED>,
+        params: SampleParams,
+    ) -> SampledType::SampleResult
+    where
+        F: Float,
+    {
+        unsafe {
+            let mut result = SampledType::Vec4::default();
+            asm!(
+                "%typeSampledImage = OpTypeSampledImage typeof*{this}",
+                "%image = OpLoad _ {this}",
+                "%sampler = OpLoad _ {sampler}",
+                "%coord = OpLoad _ {coord}",
+                "%sampledImage = OpSampledImage %typeSampledImage %image %sampler",
+                "%result = OpImageSample$LOD typeof*{result} %sampledImage %coord $PARAMS",
+                "OpStore {result} %result",
+                result = in(reg) &mut result,
+                this = in(reg) self,
+                sampler = in(reg) &sampler,
+                coord = in(reg) &coord,
+            );
+            result.truncate_into()
+        }
+    }
+
+    /// Sample the image's depth reference
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageSampleDrefImplicitLod")]
+    fn sample_depth_reference_with<F>(
+        &self,
+        sampler: Sampler,
+        coordinate: impl ImageCoordinate<F, DIM, ARRAYED>,
+        depth_reference: f32,
+        params: SampleParams,
+    ) -> SampledType
+    where
+        F: Float,
+    {
+        let mut result = Default::default();
+        unsafe {
+            asm!(
+                "%image = OpLoad _ {this}",
+                "%sampler = OpLoad _ {sampler}",
+                "%coordinate = OpLoad _ {coordinate}",
+                "%depth_reference = OpLoad _ {depth_reference}", // not required to do this way, but done for consistency
+                "%sampledImage = OpSampledImage _ %image %sampler",
+                "%result = OpImageSampleDref$LOD _ %sampledImage %coordinate %depth_reference $PARAMS",
+                "OpStore {result} %result",
+                result = in(reg) &mut result,
+                this = in(reg) self,
+                sampler = in(reg) &sampler,
+                coordinate = in(reg) &coordinate,
+                depth_reference = in(reg) &depth_reference,
+            );
+        }
+        result
+    }
+
+    /// Sample the image with a project coordinate
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageSampleProjImplicitLod")]
+    fn sample_with_project_coordinate_with<F>(
+        &self,
+        sampler: Sampler,
+        project_coordinate: impl ImageCoordinate<F, DIM, { Arrayed::True as u32 }>,
+        params: SampleParams,
+    ) -> SampledType::SampleResult
+    where
+        F: Float,
+    {
+        unsafe {
+            let mut result = SampledType::Vec4::default();
+            asm!(
+                "%image = OpLoad _ {this}",
+                "%sampler = OpLoad _ {sampler}",
+                "%project_coordinate = OpLoad _ {project_coordinate}",
+                "%sampledImage = OpSampledImage _ %image %sampler",
+                "%result = OpImageSampleProj$LOD _ %sampledImage %project_coordinate $PARAMS",
+                "OpStore {result} %result",
+                result = in(reg) &mut result,
+                this = in(reg) self,
+                sampler = in(reg) &sampler,
+                project_coordinate = in(reg) &project_coordinate,
+            );
+            result.truncate_into()
+        }
+    }
+
+    /// Sample the image's depth reference with the project coordinate
+    #[crate::macros::gpu_only]
+    #[doc(alias = "OpImageSampleProjDrefImplicitLod")]
+    fn sample_depth_reference_with_project_coordinate_with<F>(
+        &self,
+        sampler: Sampler,
+        project_coordinate: impl ImageCoordinate<F, DIM, { Arrayed::True as u32 }>,
+        depth_reference: f32,
+        params: SampleParams,
+    ) -> SampledType
+    where
+        F: Float,
+    {
+        let mut result = Default::default();
+        unsafe {
+            asm!(
+                "%image = OpLoad _ {this}",
+                "%sampler = OpLoad _ {sampler}",
+                "%project_coordinate = OpLoad _ {project_coordinate}",
+                "%depth_reference = OpLoad _ {depth_reference}", // not required to do this way, but done for consistency
+                "%sampledImage = OpSampledImage _ %image %sampler",
+                "%result = OpImageSampleProjDref$LOD _ %sampledImage %project_coordinate %depth_reference $PARAMS",
+                "OpStore {result} %result",
+                result = in(reg) &mut result,
+                this = in(reg) self,
+                sampler = in(reg) &sampler,
+                project_coordinate = in(reg) &project_coordinate,
+                depth_reference = in(reg) &depth_reference,
+            );
+        }
+        result
     }
 }
 

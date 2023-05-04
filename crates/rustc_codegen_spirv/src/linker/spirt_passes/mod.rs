@@ -1,5 +1,6 @@
 //! SPIR-T pass infrastructure and supporting utilities.
 
+pub(crate) mod diagnostics;
 mod fuse_selects;
 mod reduce;
 
@@ -59,8 +60,17 @@ macro_rules! def_spv_spec_with_extra_well_known {
                         }
 
                         let spv_spec = spv::spec::Spec::get();
+                        let wk = &spv_spec.well_known;
+
+                        let decorations = match &spv_spec.operand_kinds[wk.Decoration] {
+                            spv::spec::OperandKindDef::ValueEnum { variants } => variants,
+                            _ => unreachable!(),
+                        };
+
                         let lookup_fns = PerWellKnownGroup {
                             opcode: |name| spv_spec.instructions.lookup(name).unwrap(),
+                            operand_kind: |name| spv_spec.operand_kinds.lookup(name).unwrap(),
+                            decoration: |name| decorations.lookup(name).unwrap().into(),
                         };
 
                         SpvSpecWithExtras {
@@ -87,11 +97,18 @@ def_spv_spec_with_extra_well_known! {
         OpCompositeInsert,
         OpCompositeExtract,
     ],
+    operand_kind: spv::spec::OperandKind = [
+        ExecutionModel,
+    ],
+    decoration: u32 = [
+        UserTypeGOOGLE,
+    ],
 }
 
 /// Run intra-function passes on all `Func` definitions in the `Module`.
 //
 // FIXME(eddyb) introduce a proper "pass manager".
+// FIXME(eddyb) why does this focus on functions, it could just be module passes??
 pub(super) fn run_func_passes<P>(
     module: &mut Module,
     passes: &[impl AsRef<str>],
@@ -112,7 +129,8 @@ pub(super) fn run_func_passes<P>(
             seen_global_vars: FxIndexSet::default(),
             seen_funcs: FxIndexSet::default(),
         };
-        for &exportee in module.exports.values() {
+        for (export_key, &exportee) in &module.exports {
+            export_key.inner_visit_with(&mut collector);
             exportee.inner_visit_with(&mut collector);
         }
         collector.seen_funcs
@@ -120,6 +138,30 @@ pub(super) fn run_func_passes<P>(
 
     for name in passes {
         let name = name.as_ref();
+
+        // HACK(eddyb) not really a function pass.
+        if name == "qptr" {
+            let layout_config = &spirt::qptr::LayoutConfig {
+                abstract_bool_size_align: (1, 1),
+                logical_ptr_size_align: (4, 4),
+                ..spirt::qptr::LayoutConfig::VULKAN_SCALAR_LAYOUT
+            };
+
+            let profiler = before_pass("qptr::lower_from_spv_ptrs", module);
+            spirt::passes::qptr::lower_from_spv_ptrs(module, layout_config);
+            after_pass("qptr::lower_from_spv_ptrs", module, profiler);
+
+            let profiler = before_pass("qptr::analyze_uses", module);
+            spirt::passes::qptr::analyze_uses(module, layout_config);
+            after_pass("qptr::analyze_uses", module, profiler);
+
+            let profiler = before_pass("qptr::lift_to_spv_ptrs", module);
+            spirt::passes::qptr::lift_to_spv_ptrs(module, layout_config);
+            after_pass("qptr::lift_to_spv_ptrs", module, profiler);
+
+            continue;
+        }
+
         let (full_name, pass_fn): (_, fn(_, &mut _)) = match name {
             "reduce" => ("spirt_passes::reduce", reduce::reduce_in_func),
             "fuse_selects" => (

@@ -5,7 +5,7 @@ mod type_;
 
 use crate::builder::{ExtInst, InstructionTable};
 use crate::builder_spirv::{BuilderCursor, BuilderSpirv, SpirvConst, SpirvValue, SpirvValueKind};
-use crate::decorations::{CustomDecoration, SerializedSpan, ZombieDecoration};
+use crate::decorations::{CustomDecoration, SrcLocDecoration, ZombieDecoration};
 use crate::spirv_type::{SpirvType, SpirvTypePrinter, TypeCache};
 use crate::symbols::Symbols;
 use crate::target::SpirvTarget;
@@ -25,7 +25,7 @@ use rustc_middle::ty::layout::{HasParamEnv, HasTyCtxt};
 use rustc_middle::ty::{Instance, ParamEnv, PolyExistentialTraitRef, Ty, TyCtxt};
 use rustc_session::Session;
 use rustc_span::def_id::DefId;
-use rustc_span::symbol::{sym, Symbol};
+use rustc_span::symbol::Symbol;
 use rustc_span::{SourceFile, Span, DUMMY_SP};
 use rustc_target::abi::call::{FnAbi, PassMode};
 use rustc_target::abi::{HasDataLayout, TargetDataLayout};
@@ -50,10 +50,11 @@ pub struct CodegenCx<'tcx> {
     /// Cache generated vtables
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<PolyExistentialTraitRef<'tcx>>), SpirvValue>>,
     pub ext_inst: RefCell<ExtInst>,
-    /// Invalid spir-v IDs that should be stripped from the final binary,
+    /// Invalid SPIR-V IDs that should be stripped from the final binary,
     /// each with its own reason and span that should be used for reporting
     /// (in the event that the value is actually needed)
-    zombie_decorations: RefCell<FxHashMap<Word, ZombieDecoration>>,
+    zombie_decorations:
+        RefCell<FxHashMap<Word, (ZombieDecoration<'tcx>, Option<SrcLocDecoration<'tcx>>)>>,
     /// Cache of all the builtin symbols we need
     pub sym: Rc<Symbols>,
     pub instruction_table: InstructionTable,
@@ -117,7 +118,7 @@ impl<'tcx> CodegenCx<'tcx> {
         Self {
             tcx,
             codegen_unit,
-            builder: BuilderSpirv::new(&sym, &target, &features),
+            builder: BuilderSpirv::new(tcx, &sym, &target, &features),
             instances: Default::default(),
             function_parameter_values: Default::default(),
             type_cache: Default::default(),
@@ -163,71 +164,43 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     /// Zombie system:
-    /// When compiling libcore and other system libraries, if something unrepresentable is
-    /// encountered, we don't want to fail the compilation. Instead, we emit something bogus
-    /// (usually it's fairly faithful, though, e.g. u128 emits `OpTypeInt 128`), and then mark the
-    /// resulting ID as a "zombie". We continue compiling the rest of the crate, then, at the very
-    /// end, anything that transtively references a zombie value is stripped from the binary.
     ///
-    /// If an exported function is stripped, then we emit a special "zombie export" item, which is
-    /// consumed by the linker, which continues to infect other values that reference it.
+    /// If something unrepresentable is encountered, we don't want to fail
+    /// the compilation. Instead, we emit something bogus (usually it's fairly
+    /// faithful, though, e.g. `u128` emits `OpTypeInt 128 0`), and then mark the
+    /// resulting ID as a "zombie". We continue compiling the rest of the crate,
+    /// then, at the very end, anything that transitively references a zombie value
+    /// is stripped from the binary.
     ///
-    /// Finally, if *user* code is marked as zombie, then this means that the user tried to do
-    /// something that isn't supported, and should be an error.
+    /// Errors will only be emitted (by `linker::zombies`) for reachable zombies.
     pub fn zombie_with_span(&self, word: Word, span: Span, reason: &str) {
-        if self.is_system_crate(span) {
-            self.zombie_even_in_user_code(word, span, reason);
-        } else {
-            self.tcx.sess.span_err(span, reason);
-        }
+        self.zombie_decorations.borrow_mut().insert(
+            word,
+            (
+                ZombieDecoration {
+                    // FIXME(eddyb) this could take advantage of `Cow` and use
+                    // either `&'static str` or `String`, on a case-by-case basis.
+                    reason: reason.to_string().into(),
+                },
+                SrcLocDecoration::from_rustc_span(span, &self.builder),
+            ),
+        );
     }
     pub fn zombie_no_span(&self, word: Word, reason: &str) {
         self.zombie_with_span(word, DUMMY_SP, reason);
     }
-    pub fn zombie_even_in_user_code(&self, word: Word, span: Span, reason: &str) {
-        self.zombie_decorations.borrow_mut().insert(
-            word,
-            ZombieDecoration {
-                reason: reason.to_string(),
-                span: SerializedSpan::from_rustc(span, self.tcx.sess.source_map()),
-            },
-        );
-    }
-
-    /// Returns `true` if the originating crate of `span` (which could very well
-    /// be a different crate, e.g. a generic/`#[inline]` function, or a macro),
-    /// is a "system crate", and therefore allowed to have some errors deferred
-    /// as "zombies" (see `zombie_with_span`'s docs above for more details).
-    pub fn is_system_crate(&self, span: Span) -> bool {
-        // HACK(eddyb) this ignores `.lo` vs `.hi` potentially resulting in
-        // different `SourceFile`s (which is likely a bug anyway).
-        let cnum = self
-            .tcx
-            .sess
-            .source_map()
-            .lookup_source_file(span.data().lo)
-            .cnum;
-
-        self.tcx
-            .get_attr(cnum.as_def_id(), sym::compiler_builtins)
-            .is_some()
-            || [
-                sym::core,
-                self.sym.spirv_std,
-                self.sym.libm,
-                self.sym.num_traits,
-            ]
-            .contains(&self.tcx.crate_name(cnum))
-    }
 
     pub fn finalize_module(self) -> Module {
         let mut result = self.builder.finalize();
-        result.annotations.extend(
-            self.zombie_decorations
-                .into_inner()
-                .into_iter()
-                .map(|(id, zombie)| zombie.encode(id)),
-        );
+        result
+            .annotations
+            .extend(self.zombie_decorations.into_inner().into_iter().flat_map(
+                |(id, (zombie, src_loc))| {
+                    [zombie.encode_to_inst(id)]
+                        .into_iter()
+                        .chain(src_loc.map(|src_loc| src_loc.encode_to_inst(id)))
+                },
+            ));
         result
     }
 
@@ -356,6 +329,16 @@ impl CodegenArgs {
                 "",
                 "no-compact-ids",
                 "disables compaction of SPIR-V IDs at the end of linking",
+            );
+            opts.optflag(
+                "",
+                "no-early-report-zombies",
+                "delays reporting zombies (to allow more legalization)",
+            );
+            opts.optflag(
+                "",
+                "no-infer-storage-classes",
+                "disables SPIR-V Storage Class inference",
             );
             opts.optflag("", "no-structurize", "disables CFG structurization");
 
@@ -536,6 +519,8 @@ impl CodegenArgs {
             // FIXME(eddyb) clean up this `no-` "negation prefix" situation.
             dce: !matches.opt_present("no-dce"),
             compact_ids: !matches.opt_present("no-compact-ids"),
+            early_report_zombies: !matches.opt_present("no-early-report-zombies"),
+            infer_storage_classes: !matches.opt_present("no-infer-storage-classes"),
             structurize: !matches.opt_present("no-structurize"),
             spirt: !matches.opt_present("no-spirt"),
             spirt_passes: matches
@@ -788,11 +773,9 @@ impl<'tcx> MiscMethods<'tcx> for CodegenCx<'tcx> {
         }
         .def(span, self);
 
-        if self.is_system_crate(span) {
-            // Create these undefs up front instead of on demand in SpirvValue::def because
-            // SpirvValue::def can't use cx.emit()
-            self.def_constant(ty, SpirvConst::ZombieUndefForFnAddr);
-        }
+        // Create these `OpUndef`s up front, instead of on-demand in `SpirvValue::def`,
+        // because `SpirvValue::def` can't use `cx.emit()`.
+        self.def_constant(ty, SpirvConst::ZombieUndefForFnAddr);
 
         SpirvValue {
             kind: SpirvValueKind::FnAddr {

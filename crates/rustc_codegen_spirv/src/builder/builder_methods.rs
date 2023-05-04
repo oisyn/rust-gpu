@@ -171,7 +171,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         if invalid_seq_cst {
             self.zombie(
                 semantics.def(self),
-                "Cannot use AtomicOrdering=SequentiallyConsistent on Vulkan memory model. Check if AcquireRelease fits your needs.",
+                "cannot use AtomicOrdering=SequentiallyConsistent on Vulkan memory model \
+                 (check if AcquireRelease fits your needs)",
             );
         }
         semantics
@@ -352,11 +353,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     fn zombie_convert_ptr_to_u(&self, def: Word) {
-        self.zombie(def, "Cannot convert pointers to integers");
+        self.zombie(def, "cannot convert pointers to integers");
     }
 
     fn zombie_convert_u_to_ptr(&self, def: Word) {
-        self.zombie(def, "Cannot convert integers to pointers");
+        self.zombie(def, "cannot convert integers to pointers");
     }
 
     fn zombie_ptr_equal(&self, def: Word, inst: &str) {
@@ -656,12 +657,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn set_span(&mut self, span: Span) {
         self.current_span = Some(span);
-        let loc = self.cx.tcx.sess.source_map().lookup_char_pos(span.lo());
-        let file = self
-            .builder
-            .def_string(format!("{}", loc.file.name.prefer_remapped()));
-        self.emit()
-            .line(file, loc.line as u32, loc.col_display as u32);
+
+        // We may not always have valid spans.
+        // FIXME(eddyb) reduce the sources of this as much as possible.
+        if span.is_dummy() {
+            self.emit().no_line();
+        } else {
+            let (file, line, col) = self.builder.file_line_col_for_op_line(span);
+            self.emit().line(file.file_name_op_string_id, line, col);
+        }
     }
 
     // FIXME(eddyb) change `Self::Function` to be more like a function index.
@@ -1263,7 +1267,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if let SpirvValueKind::LogicalPtrCast {
             original_ptr,
             original_pointee_ty,
-            zombie_target_undef: _,
+            bitcast_result_id: _,
         } = ptr.kind
         {
             let offset = match pointee_kind {
@@ -1450,21 +1454,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .with_type(dest_ty);
 
             if val_is_ptr || dest_is_ptr {
-                if self.is_system_crate(self.span()) {
-                    self.zombie(
-                        result.def(self),
-                        &format!(
-                            "Cannot cast between pointer and non-pointer types. From: {}. To: {}.",
-                            self.debug_type(val.ty),
-                            self.debug_type(dest_ty)
-                        ),
-                    );
-                } else {
-                    self.struct_err("Cannot cast between pointer and non-pointer types")
-                        .note(&format!("from: {}", self.debug_type(val.ty)))
-                        .note(&format!("to: {}", self.debug_type(dest_ty)))
-                        .emit();
-                }
+                self.zombie(
+                    result.def(self),
+                    &format!(
+                        "cannot cast between pointer and non-pointer types\
+                         \nfrom `{}`\
+                         \n  to `{}`",
+                        self.debug_type(val.ty),
+                        self.debug_type(dest_ty)
+                    ),
+                );
             }
 
             result
@@ -1534,7 +1533,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             SpirvValueKind::LogicalPtrCast {
                 original_ptr,
                 original_pointee_ty,
-                zombie_target_undef: _,
+                bitcast_result_id: _,
             } => (
                 original_ptr.with_type(
                     SpirvType::Pointer {
@@ -1573,11 +1572,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .with_type(dest_ty)
         } else {
             // Defer the cast so that it has a chance to be avoided.
+            let original_ptr = val.def(self);
             SpirvValue {
                 kind: SpirvValueKind::LogicalPtrCast {
-                    original_ptr: val.def(self),
+                    original_ptr,
                     original_pointee_ty: val_pointee,
-                    zombie_target_undef: self.undef(dest_ty).def(self),
+                    bitcast_result_id: self.emit().bitcast(dest_ty, None, original_ptr).unwrap(),
                 },
                 ty: dest_ty,
             }
@@ -1881,7 +1881,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     empty(),
                 )
                 .unwrap();
-            self.zombie(dst.def(self), "Cannot memcpy dynamically sized data");
+            self.zombie(dst.def(self), "cannot memcpy dynamically sized data");
         }
     }
 

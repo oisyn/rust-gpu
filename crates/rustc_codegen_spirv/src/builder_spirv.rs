@@ -5,14 +5,23 @@ use crate::symbols::Symbols;
 use crate::target::SpirvTarget;
 use crate::target_feature::TargetFeature;
 use rspirv::dr::{Block, Builder, Module, Operand};
-use rspirv::spirv::{AddressingModel, Capability, MemoryModel, Op, StorageClass, Word};
+use rspirv::spirv::{
+    AddressingModel, Capability, MemoryModel, Op, SourceLanguage, StorageClass, Word,
+};
 use rspirv::{binary::Assemble, binary::Disassemble};
+use rustc_arena::DroplessArena;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::sync::Lrc;
 use rustc_middle::bug;
+use rustc_middle::ty::TyCtxt;
+use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::Symbol;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{FileName, FileNameDisplayPreference, SourceFile, Span, DUMMY_SP};
 use std::assert_matches::assert_matches;
 use std::cell::{RefCell, RefMut};
+use std::hash::{Hash, Hasher};
+use std::iter;
+use std::str;
 use std::{fs::File, io::Write, path::Path};
 
 #[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
@@ -50,10 +59,12 @@ pub enum SpirvValueKind {
         /// Pointee type of `original_ptr`.
         original_pointee_ty: Word,
 
-        /// `OpUndef` of the right target pointer type, to attach zombies to.
-        // FIXME(eddyb) we should be using a real `OpBitcast` here, but we can't
-        // emit that on the fly during `SpirvValue::def`, due to builder locking.
-        zombie_target_undef: Word,
+        /// Result ID for the `OpBitcast` instruction representing the cast,
+        /// to attach zombies to.
+        //
+        // HACK(eddyb) having an `OpBitcast` only works by being DCE'd away,
+        // or by being replaced with a noop in `qptr::lower`.
+        bitcast_result_id: Word,
     },
 }
 
@@ -131,9 +142,7 @@ impl SpirvValue {
                     IllegalConst::Indirect(cause) => cause.message(),
                 };
 
-                // HACK(eddyb) we don't know whether this constant originated
-                // in a system crate, so it's better to always zombie.
-                cx.zombie_even_in_user_code(id, span, msg);
+                cx.zombie_with_span(id, span, msg);
 
                 id
             }
@@ -149,52 +158,35 @@ impl SpirvValue {
             }
 
             SpirvValueKind::FnAddr { .. } => {
-                if cx.is_system_crate(span) {
-                    cx.builder
-                        .const_to_id
-                        .borrow()
-                        .get(&WithType {
-                            ty: self.ty,
-                            val: SpirvConst::ZombieUndefForFnAddr,
-                        })
-                        .expect("FnAddr didn't go through proper undef registration")
-                        .val
-                } else {
-                    cx.tcx.sess.span_err(
-                        span,
-                        "Cannot use this function pointer for anything other than calls",
-                    );
-                    // Because we never get beyond compilation (into e.g. linking),
-                    // emitting an invalid ID reference here is OK.
-                    0
-                }
+                cx.builder
+                    .const_to_id
+                    .borrow()
+                    .get(&WithType {
+                        ty: self.ty,
+                        val: SpirvConst::ZombieUndefForFnAddr,
+                    })
+                    .expect("FnAddr didn't go through proper undef registration")
+                    .val
             }
 
             SpirvValueKind::LogicalPtrCast {
                 original_ptr: _,
                 original_pointee_ty,
-                zombie_target_undef,
+                bitcast_result_id,
             } => {
-                if cx.is_system_crate(span) {
-                    cx.zombie_with_span(
-                        zombie_target_undef,
-                        span,
-                        &format!(
-                            "Cannot cast between pointer types. From: {}. To: {}.",
-                            cx.debug_type(original_pointee_ty),
-                            cx.debug_type(self.ty)
-                        ),
-                    );
-                } else {
-                    cx.tcx
-                        .sess
-                        .struct_span_err(span, "Cannot cast between pointer types")
-                        .note(&format!("from: *{}", cx.debug_type(original_pointee_ty)))
-                        .note(&format!("to: {}", cx.debug_type(self.ty)))
-                        .emit();
-                }
+                cx.zombie_with_span(
+                    bitcast_result_id,
+                    span,
+                    &format!(
+                        "cannot cast between pointer types\
+                         \nfrom `*{}`\
+                         \n  to `{}`",
+                        cx.debug_type(original_pointee_ty),
+                        cx.debug_type(self.ty)
+                    ),
+                );
 
-                zombie_target_undef
+                bitcast_result_id
             }
         }
     }
@@ -321,6 +313,44 @@ struct WithConstLegality<V> {
     legal: Result<(), IllegalConst>,
 }
 
+/// `HashMap` key type (for `debug_file_cache` in `BuilderSpirv`), which is
+/// equivalent to a whole `rustc` `SourceFile`, but has O(1) `Eq` and `Hash`
+/// implementations (i.e. not involving the path or the contents of the file).
+///
+/// This is possible because we can compare `Lrc<SourceFile>`s by equality, as
+/// `rustc`'s `SourceMap` already ensures that only one `SourceFile` will be
+/// allocated for some given file. For hashing, we could hash the address, or
+///
+struct DebugFileKey(Lrc<SourceFile>);
+
+impl PartialEq for DebugFileKey {
+    fn eq(&self, other: &Self) -> bool {
+        let (Self(self_sf), Self(other_sf)) = (self, other);
+        Lrc::ptr_eq(self_sf, other_sf)
+    }
+}
+impl Eq for DebugFileKey {}
+
+impl Hash for DebugFileKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self(sf) = self;
+        sf.name_hash.hash(state);
+        sf.src_hash.hash(state);
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct DebugFileSpirv<'tcx> {
+    pub file_name: &'tcx str,
+
+    /// The SPIR-V ID for the result of the `OpString` instruction containing
+    /// `file_name` - this is what e.g. `OpLine` uses to identify the file.
+    ///
+    /// All other details about the file are also attached to this ID, using
+    /// other instructions that don't produce their own IDs (e.g. `OpSource`).
+    pub file_name_op_string_id: Word,
+}
+
 /// Cursor system:
 ///
 /// The LLVM module builder model (and therefore `codegen_ssa`) assumes that there is a central
@@ -351,6 +381,9 @@ pub struct BuilderCursor {
 }
 
 pub struct BuilderSpirv<'tcx> {
+    source_map: &'tcx SourceMap,
+    dropless_arena: &'tcx DroplessArena,
+
     builder: RefCell<Builder>,
 
     // Bidirectional maps between `SpirvConst` and the ID of the defined global
@@ -359,14 +392,20 @@ pub struct BuilderSpirv<'tcx> {
     // allows getting that legality information without additional lookups.
     const_to_id: RefCell<FxHashMap<WithType<SpirvConst<'tcx>>, WithConstLegality<Word>>>,
     id_to_const: RefCell<FxHashMap<Word, WithConstLegality<SpirvConst<'tcx>>>>,
-    string_cache: RefCell<FxHashMap<String, Word>>,
+
+    debug_file_cache: RefCell<FxHashMap<DebugFileKey, DebugFileSpirv<'tcx>>>,
 
     enabled_capabilities: FxHashSet<Capability>,
     enabled_extensions: FxHashSet<Symbol>,
 }
 
 impl<'tcx> BuilderSpirv<'tcx> {
-    pub fn new(sym: &Symbols, target: &SpirvTarget, features: &[TargetFeature]) -> Self {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        sym: &Symbols,
+        target: &SpirvTarget,
+        features: &[TargetFeature],
+    ) -> Self {
         let version = target.spirv_version();
         let memory_model = target.memory_model();
 
@@ -427,10 +466,12 @@ impl<'tcx> BuilderSpirv<'tcx> {
         builder.memory_model(AddressingModel::Logical, memory_model);
 
         Self {
+            source_map: tcx.sess.source_map(),
+            dropless_arena: &tcx.arena.dropless,
             builder: RefCell::new(builder),
             const_to_id: Default::default(),
             id_to_const: Default::default(),
-            string_cache: Default::default(),
+            debug_file_cache: Default::default(),
             enabled_capabilities,
             enabled_extensions,
         }
@@ -637,15 +678,109 @@ impl<'tcx> BuilderSpirv<'tcx> {
         }
     }
 
-    pub fn def_string(&self, s: String) -> Word {
-        use std::collections::hash_map::Entry;
-        match self.string_cache.borrow_mut().entry(s) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let key = entry.key().clone();
-                *entry.insert(self.builder(Default::default()).string(key))
-            }
-        }
+    pub fn file_line_col_for_op_line(&self, span: Span) -> (DebugFileSpirv<'tcx>, u32, u32) {
+        let loc = self.source_map.lookup_char_pos(span.lo());
+        (
+            self.def_debug_file(loc.file),
+            loc.line as u32,
+            loc.col_display as u32,
+        )
+    }
+
+    fn def_debug_file(&self, sf: Lrc<SourceFile>) -> DebugFileSpirv<'tcx> {
+        *self
+            .debug_file_cache
+            .borrow_mut()
+            .entry(DebugFileKey(sf))
+            .or_insert_with_key(|DebugFileKey(sf)| {
+                let mut builder = self.builder(Default::default());
+
+                // FIXME(eddyb) it would be nicer if we could just rely on
+                // `RealFileName::to_string_lossy` returning `Cow<'_, str>`,
+                // but sadly that `'_` is the lifetime of the temporary `Lrc`,
+                // not `'tcx`, so we have to arena-allocate to get `&'tcx str`.
+                let file_name = match &sf.name {
+                    FileName::Real(name) => {
+                        name.to_string_lossy(FileNameDisplayPreference::Remapped)
+                    }
+                    _ => sf.name.prefer_remapped().to_string().into(),
+                };
+                let file_name = {
+                    // FIXME(eddyb) it should be possible to arena-allocate a
+                    // `&str` directly, but it would require upstream changes,
+                    // and strings are handled by string interning in `rustc`.
+                    fn arena_alloc_slice<'tcx, T: Copy>(
+                        dropless_arena: &'tcx DroplessArena,
+                        xs: &[T],
+                    ) -> &'tcx [T] {
+                        if xs.is_empty() {
+                            &[]
+                        } else {
+                            dropless_arena.alloc_slice(xs)
+                        }
+                    }
+                    str::from_utf8(arena_alloc_slice(self.dropless_arena, file_name.as_bytes()))
+                        .unwrap()
+                };
+                let file_name_op_string_id = builder.string(file_name.to_owned());
+
+                let file_contents = self
+                    .source_map
+                    .span_to_snippet(Span::with_root_ctxt(sf.start_pos, sf.end_pos))
+                    .ok();
+
+                // HACK(eddyb) this logic is duplicated from `spirt::spv::lift`.
+                let op_source_and_continued_chunks = file_contents.as_ref().map(|contents| {
+                    // The maximum word count is `2**16 - 1`, the first word is
+                    // taken up by the opcode & word count, and one extra byte is
+                    // taken up by the nil byte at the end of the LiteralString.
+                    const MAX_OP_SOURCE_CONT_CONTENTS_LEN: usize = (0xffff - 1) * 4 - 1;
+
+                    // `OpSource` has 3 more operands than `OpSourceContinued`,
+                    // and each of them take up exactly one word.
+                    const MAX_OP_SOURCE_CONTENTS_LEN: usize =
+                        MAX_OP_SOURCE_CONT_CONTENTS_LEN - 3 * 4;
+
+                    let (op_source_str, mut all_op_source_continued_str) =
+                        contents.split_at(contents.len().min(MAX_OP_SOURCE_CONTENTS_LEN));
+
+                    // FIXME(eddyb) `spirt::spv::lift` should use this.
+                    let all_op_source_continued_str_chunks = iter::from_fn(move || {
+                        let contents_rest = &mut all_op_source_continued_str;
+                        if contents_rest.is_empty() {
+                            return None;
+                        }
+
+                        // FIXME(eddyb) test with UTF-8! this `split_at` should
+                        // actually take *less* than the full possible size, to
+                        // avoid cutting a UTF-8 sequence.
+                        let (cont_chunk, rest) = contents_rest
+                            .split_at(contents_rest.len().min(MAX_OP_SOURCE_CONT_CONTENTS_LEN));
+                        *contents_rest = rest;
+                        Some(cont_chunk)
+                    });
+                    (op_source_str, all_op_source_continued_str_chunks)
+                });
+
+                if let Some((op_source_str, all_op_source_continued_str_chunks)) =
+                    op_source_and_continued_chunks
+                {
+                    builder.source(
+                        SourceLanguage::Unknown,
+                        0,
+                        Some(file_name_op_string_id),
+                        Some(op_source_str),
+                    );
+                    for cont_chunk in all_op_source_continued_str_chunks {
+                        builder.source_continued(cont_chunk);
+                    }
+                }
+
+                DebugFileSpirv {
+                    file_name,
+                    file_name_op_string_id,
+                }
+            })
     }
 
     pub fn set_global_initializer(&self, global: Word, initializer: Word) {

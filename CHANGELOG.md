@@ -27,17 +27,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -->
 
-## [Unreleased]
+## [0.7.0]
 
 ### Added ⭐
+- [PR#1020](https://github.com/EmbarkStudios/rust-gpu/pull/1020) added SPIR-T `qptr`
+  support in the form of `--spirt-passes=qptr`, a way to turn off "Storage Class inference",
+  and reporting for SPIR-T diagnostics - to test `qptr` fully, you can use:  
+  `RUSTGPU_CODEGEN_ARGS="--no-infer-storage-classes --spirt-passes=qptr"`  
+  (see also [the SPIR-T `qptr` PR](https://github.com/EmbarkStudios/spirt/pull/24) for more details about the `qptr` experiment)
+- [PR#1039](https://github.com/EmbarkStudios/rust-gpu/pull/1039) added new experimental `sample_with` to `Image` API to set additional image operands
 - [PR#1031](https://github.com/EmbarkStudios/rust-gpu/pull/1031) added `Components` generic parameter to `Image` type, allowing images to return lower dimensional vectors and even scalars from the sampling API
 
 ### Changed 🛠
+- [PR#1040](https://github.com/EmbarkStudios/rust-gpu/pull/1040) refactored "zombie" (delayed error) reporting to use SPIR-V `OpSource`, be more helpful, and added `--no-early-report-zombies` to delay it even further  
+  (see also [the `--no-early-report-zombies` codegen args docs](docs/src/codegen-args.md#--no-early-report-zombies))
 - [PR#1035](https://github.com/EmbarkStudios/rust-gpu/pull/1035) reduced the number of CGUs ("codegen units") used by `spirv-builder` to just `1`
 - [PR#1011](https://github.com/EmbarkStudios/rust-gpu/pull/1011) made `NonWritable` all read-only storage buffers (i.e. those typed `&T`, where `T` doesn't have interior mutability)
 - [PR#1029](https://github.com/EmbarkStudios/rust-gpu/pull/1029) fixed SampledImage::sample() fns being unnecessarily marked as unsafe
 
 ### Fixed 🩹
+- [PR#1041](https://github.com/EmbarkStudios/rust-gpu/pull/1041) fixed `Image::gather()` not always returning a `Vec4`.
 - [PR#1025](https://github.com/EmbarkStudios/rust-gpu/pull/1025) fixed [#1024](https://github.com/EmbarkStudios/rust-gpu/issues/1024) by keeping checked arithmetic "zombie" `bool`s disjoint from normal `bool` (`false`) consts
 - [PR#1023](https://github.com/EmbarkStudios/rust-gpu/pull/1023) fixed [#1021](https://github.com/EmbarkStudios/rust-gpu/issues/1021) by always inlining calls with "not obviously legal" pointer args (instead of only inlining calls with "obviously illegal" pointer args)
 - [PR#1009](https://github.com/EmbarkStudios/rust-gpu/pull/1009) fixed [#1008](https://github.com/EmbarkStudios/rust-gpu/issues/1008) by reinstating mutability checks for entry-point parameters pointing into read-only storage classes (e.g. `#[spirv(uniform)] x: &mut u32` is now again an error)
